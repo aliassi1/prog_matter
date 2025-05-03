@@ -551,3 +551,25 @@ class MAPPOAgent:
 
         # Always clear memory after update
         self.reset_memory()
+
+    def state_dict(self):
+        """Return the state dict for checkpointing."""
+        return {
+            'actor': self.actor.state_dict(),
+            'critic': self.critic.state_dict(),
+            'actor_optimizer': self.actor_optimizer.state_dict(),
+            'critic_optimizer': self.critic_optimizer.state_dict(),
+            'actor_scheduler': self.actor_scheduler.state_dict(),
+            'critic_scheduler': self.critic_scheduler.state_dict(),
+            'update_count': self.update_count,
+        }
+
+    def load_state_dict(self, state_dict):
+        """Load the state dict from checkpoint."""
+        self.actor.load_state_dict(state_dict['actor'])
+        self.critic.load_state_dict(state_dict['critic'])
+        self.actor_optimizer.load_state_dict(state_dict['actor_optimizer'])
+        self.critic_optimizer.load_state_dict(state_dict['critic_optimizer'])
+        self.actor_scheduler.load_state_dict(state_dict['actor_scheduler'])
+        self.critic_scheduler.load_state_dict(state_dict['critic_scheduler'])
+        self.update_count = state_dict.get('update_count', 0)

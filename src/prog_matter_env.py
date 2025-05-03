@@ -6,6 +6,7 @@ from gym import spaces
 from pettingzoo import ParallelEnv
 from typing import Dict, List, Tuple, Any
 from scipy.optimize import linear_sum_assignment
+import heapq
 
 # Constants for directions
 DIRECTIONS = [
@@ -34,16 +35,18 @@ class ProgrammableMatterEnv(ParallelEnv):
         render_mode: str = None,
         connectivity_weight: float = 1.0,
         progress_weight: float = 0.1,
-        step_penalty: float = 0.01,
-        completion_reward: float = 10.0,
+        step_penalty: float = 0.1,
+        completion_reward: float = 100.0,
         obstacle_positions=None,
+        target_positions=None,
     ):
         """Initialize the programmable matter environment."""
         super().__init__()
         self.n, self.m = grid_size
-        self._num_agents = num_agents  # Change this line to use a protected attribute
+        self._num_agents = num_agents
         self.max_steps = max_steps
         self.render_mode = render_mode
+        self.target_positions = target_positions
 
         # Reward weights
         self.connectivity_weight = connectivity_weight
@@ -112,6 +115,9 @@ class ProgrammableMatterEnv(ParallelEnv):
         # Setup for rendering
         self.renderer = None
 
+        # Add visited positions
+        self.visited_positions = {agent_id: set() for agent_id in self.agents}
+
     def reset(self, seed=None, return_info=False, options=None):
         """Reset the environment to initial state."""
         if seed is not None:
@@ -121,7 +127,7 @@ class ProgrammableMatterEnv(ParallelEnv):
         self.steps_taken = 0
 
         # Reset agents
-        self.agents = self.possible_agents.copy()
+        self.agents = list(self.possible_agents)  # Ensure this is a list, not a dict
 
         # Random initialization of agent positions (ensuring connectivity)
         self.agent_positions = {}
@@ -179,7 +185,11 @@ class ProgrammableMatterEnv(ParallelEnv):
         # Calculate rewards
         rewards = {}
         for agent_id in self.agents:
+            pos = self.agent_positions[agent_id]
             rewards[agent_id] = self._calculate_reward(agent_id)
+            if pos in self.visited_positions[agent_id]:
+                rewards[agent_id] -= 0.5
+            self.visited_positions[agent_id].add(pos)
 
         # Update previous distances
         for agent_id in self.agents:
@@ -189,9 +199,11 @@ class ProgrammableMatterEnv(ParallelEnv):
 
         # Check if done
         dones = {}
+        target_reached = {}
         all_at_target = True
         for agent_id in self.agents:
             at_target = self.agent_positions[agent_id] == self.agent_targets[agent_id]
+            target_reached[agent_id] = at_target
             if not at_target:
                 all_at_target = False
             dones[agent_id] = at_target or self.steps_taken >= self.max_steps
@@ -209,7 +221,7 @@ class ProgrammableMatterEnv(ParallelEnv):
             observations[agent_id] = self._get_observation(agent_id)
 
         # Additional info
-        infos = {agent_id: {} for agent_id in self.agents}
+        infos = {agent_id: {"target_reached": target_reached[agent_id]} for agent_id in self.agents}
 
         # Optionally render
         if self.render_mode == "human":
@@ -295,6 +307,39 @@ class ProgrammableMatterEnv(ParallelEnv):
             clustering_factor: 0-1 value where 0 means random targets and
                              1 means highly clustered targets
         """
+        # If target positions are provided, use them
+        if self.target_positions is not None:
+            # Ensure we have enough target positions
+            if len(self.target_positions) < self.num_agents:
+                # If not enough targets, generate additional ones
+                additional_targets = self._generate_additional_targets(
+                    self.num_agents - len(self.target_positions),
+                    clustering_factor
+                )
+                self.target_positions.extend(additional_targets)
+            
+            # Ensure no agent starts on its target
+            for agent_id, agent_pos in self.agent_positions.items():
+                while agent_pos in self.target_positions:
+                    # Regenerate the conflicting target
+                    idx = self.target_positions.index(agent_pos)
+                    new_target = self._generate_additional_targets(1, clustering_factor)[0]
+                    self.target_positions[idx] = new_target
+            
+            # Assign targets using Hungarian algorithm for optimal assignment
+            cost_matrix = np.zeros((self.num_agents, len(self.target_positions)))
+            for i, agent_id in enumerate(self.agents):
+                agent_pos = self.agent_positions[agent_id]
+                for j, target_pos in enumerate(self.target_positions):
+                    cost_matrix[i, j] = self._calculate_distance(agent_pos, target_pos)
+            
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            self.agent_targets = {
+                agent_id: self.target_positions[col_ind[i]]
+                for i, agent_id in enumerate(self.agents)
+            }
+            return
+
         # Create target positions (with clustering)
         target_positions = []
 
@@ -315,12 +360,13 @@ class ProgrammableMatterEnv(ParallelEnv):
                 x = int(center_x + distance * math.cos(angle))
                 y = int(center_y + distance * math.sin(angle))
 
-                # Ensure coordinates are within bounds and not obstacles
+                # Ensure coordinates are within bounds and not obstacles or agent positions
                 if (
                     0 <= x < self.n
                     and 0 <= y < self.m
                     and self.grid[x, y] == 1
                     and (x, y) not in target_positions
+                    and (x, y) not in self.agent_positions.values()
                 ):
                     target_positions.append((x, y))
         else:
@@ -332,7 +378,7 @@ class ProgrammableMatterEnv(ParallelEnv):
                 if (
                     self.grid[x, y] == 1
                     and (x, y) not in target_positions
-                    and not any((x, y) == pos for pos in self.agent_positions.values())
+                    and (x, y) not in self.agent_positions.values()
                 ):
                     target_positions.append((x, y))
 
@@ -344,9 +390,57 @@ class ProgrammableMatterEnv(ParallelEnv):
                 cost_matrix[i, j] = self._calculate_distance(agent_pos, target_pos)
 
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        self.agent_targets = {
+            agent_id: target_positions[col_ind[i]]
+            for i, agent_id in enumerate(self.agents)
+        }
+        self.target_positions = target_positions
 
-        for i, agent_id in enumerate(self.agents):
-            self.agent_targets[agent_id] = target_positions[col_ind[i]]
+    def _generate_additional_targets(self, num_additional, clustering_factor):
+        """Generate additional target positions when needed."""
+        additional_targets = []
+        
+        if clustering_factor > 0:
+            # Use existing target positions to determine clustering
+            if self.target_positions:
+                # Calculate center from existing targets
+                center_x = sum(x for x, _ in self.target_positions) / len(self.target_positions)
+                center_y = sum(y for _, y in self.target_positions) / len(self.target_positions)
+            else:
+                center_x = self.n // 2
+                center_y = self.m // 2
+
+            max_radius = min(self.n, self.m) * (1 - clustering_factor) * 0.5
+
+            while len(additional_targets) < num_additional:
+                angle = 2 * math.pi * random.random()
+                distance = max_radius * random.random()
+                x = int(center_x + distance * math.cos(angle))
+                y = int(center_y + distance * math.sin(angle))
+
+                if (
+                    0 <= x < self.n
+                    and 0 <= y < self.m
+                    and self.grid[x, y] == 1
+                    and (x, y) not in self.target_positions
+                    and (x, y) not in additional_targets
+                ):
+                    additional_targets.append((x, y))
+        else:
+            # Random additional targets
+            while len(additional_targets) < num_additional:
+                x = np.random.randint(0, self.n)
+                y = np.random.randint(0, self.m)
+
+                if (
+                    self.grid[x, y] == 1
+                    and (x, y) not in self.target_positions
+                    and (x, y) not in additional_targets
+                    and not any((x, y) == pos for pos in self.agent_positions.values())
+                ):
+                    additional_targets.append((x, y))
+
+        return additional_targets
 
     def _get_observation(self, agent_id):
         """Create observation for an agent."""
@@ -409,10 +503,25 @@ class ProgrammableMatterEnv(ParallelEnv):
         # Calculate current distance to target
         current_distance = self._calculate_distance(current_pos, target_pos)
 
-        # Progress reward (positive if agent got closer to target)
+        # Progress reward (positive only if agent got closer to target)
         previous_distance = self.previous_distances[agent_id]
         progress = previous_distance - current_distance
-        reward += progress * self.progress_weight
+        
+        # Stronger rewards/penalties for movement
+        if progress > 0:
+            # Scale the reward based on how much closer the agent got
+            reward += progress * self.progress_weight * 5.0  # Increased from 2.0
+        elif progress < 0:
+            # Stronger penalty for moving away from target
+            reward += progress * self.progress_weight * 5.0  # Increased from 3.0
+        else:
+            # Stronger penalty for not making progress
+            reward -= self.step_penalty * 2.0
+
+        # Additional reward for being closer to target (inverse distance reward)
+        max_possible_distance = math.sqrt(self.n**2 + self.m**2)
+        distance_reward = (max_possible_distance - current_distance) / max_possible_distance
+        reward += distance_reward * self.progress_weight * 0.2  # Reduced from 0.5 to prevent staying still
 
         # Completion reward if agent reached its target
         if current_pos == target_pos:
@@ -425,6 +534,9 @@ class ProgrammableMatterEnv(ParallelEnv):
 
         # Step penalty to encourage efficiency
         reward -= self.step_penalty
+
+        # Update previous distance for next step
+        self.previous_distances[agent_id] = current_distance
 
         return reward
 
@@ -607,3 +719,168 @@ class ProgrammableMatterEnv(ParallelEnv):
         self._num_agents = value
         # Update possible_agents if needed
         self.possible_agents = [f"agent_{i}" for i in range(self._num_agents)]
+
+    def _generate_target_positions(self, num_targets, pattern, clustering_factor=0.5):
+        """Generate connected target positions based on pattern."""
+        target_positions = []
+        
+        # Start with a central point
+        center_x = self.n // 2
+        center_y = self.m // 2
+        
+        if pattern == "single":
+            # Single target in the center
+            target_positions.append((center_x, center_y))
+            
+        elif pattern == "line":
+            # Horizontal line in the middle
+            length = min(num_targets, self.n - 4)  # Leave margin
+            start_x = center_x - length // 2
+            for i in range(num_targets):
+                x = start_x + i
+                y = center_y
+                if 0 <= x < self.n and self.grid[x, y] == 1:
+                    target_positions.append((x, y))
+                    
+        elif pattern == "square":
+            # Square formation
+            side_length = int(np.sqrt(num_targets))
+            if side_length * side_length < num_targets:
+                side_length += 1
+                
+            start_x = center_x - side_length // 2
+            start_y = center_y - side_length // 2
+            
+            for i in range(side_length):
+                for j in range(side_length):
+                    if len(target_positions) >= num_targets:
+                        break
+                    x = start_x + i
+                    y = start_y + j
+                    if (0 <= x < self.n and 0 <= y < self.m and 
+                        self.grid[x, y] == 1 and (x, y) not in target_positions):
+                        target_positions.append((x, y))
+                        
+        elif pattern == "circle":
+            # Circular formation
+            radius = min(self.n, self.m) // 4
+            for i in range(num_targets):
+                angle = 2 * np.pi * i / num_targets
+                x = int(center_x + radius * np.cos(angle))
+                y = int(center_y + radius * np.sin(angle))
+                if (0 <= x < self.n and 0 <= y < self.m and 
+                    self.grid[x, y] == 1 and (x, y) not in target_positions):
+                    target_positions.append((x, y))
+                    
+        elif pattern == "diamond":
+            # Diamond formation
+            size = min(self.n, self.m) // 3
+            for i in range(num_targets):
+                angle = 2 * np.pi * i / num_targets
+                x = int(center_x + size * np.cos(angle) * np.abs(np.cos(angle)))
+                y = int(center_y + size * np.sin(angle) * np.abs(np.sin(angle)))
+                if (0 <= x < self.n and 0 <= y < self.m and 
+                    self.grid[x, y] == 1 and (x, y) not in target_positions):
+                    target_positions.append((x, y))
+                    
+        elif pattern == "complex":
+            # Complex pattern combining multiple shapes
+            # Start with a circle and add branches
+            radius = min(self.n, self.m) // 4
+            for i in range(num_targets):
+                angle = 2 * np.pi * i / num_targets
+                # Vary the radius to create a more complex shape
+                r = radius * (0.7 + 0.3 * np.sin(3 * angle))
+                x = int(center_x + r * np.cos(angle))
+                y = int(center_y + r * np.sin(angle))
+                if (0 <= x < self.n and 0 <= y < self.m and 
+                    self.grid[x, y] == 1 and (x, y) not in target_positions):
+                    target_positions.append((x, y))
+        
+        # Ensure targets are connected
+        if not self._is_connected(target_positions):
+            # If not connected, try to connect them
+            connected_targets = self._connect_targets(target_positions)
+            if connected_targets:
+                target_positions = connected_targets
+            else:
+                # If can't connect, generate new positions
+                return self._generate_target_positions(num_targets, pattern, clustering_factor)
+        
+        return target_positions
+    
+    def _connect_targets(self, targets):
+        """Connect disconnected target positions."""
+        if not targets:
+            return targets
+            
+        connected = [targets[0]]
+        remaining = targets[1:]
+        
+        while remaining:
+            found_connection = False
+            for i, target in enumerate(remaining):
+                for connected_target in connected:
+                    if self._are_adjacent(target, connected_target):
+                        connected.append(target)
+                        remaining.pop(i)
+                        found_connection = True
+                        break
+                if found_connection:
+                    break
+                    
+            if not found_connection:
+                # Try to find a path between disconnected components
+                for i, target in enumerate(remaining):
+                    for connected_target in connected:
+                        path = self._find_path(target, connected_target)
+                        if path:
+                            connected.extend(path)
+                            remaining.pop(i)
+                            found_connection = True
+                            break
+                    if found_connection:
+                        break
+                        
+            if not found_connection:
+                return None
+                
+        return connected
+    
+    def _are_adjacent(self, pos1, pos2):
+        """Check if two positions are adjacent (8-connectivity)."""
+        return max(abs(pos1[0] - pos2[0]), abs(pos1[1] - pos2[1])) <= 1
+    
+    def _find_path(self, start, end):
+        """Find a path between two positions using A*."""
+        # Implementation of A* pathfinding
+        open_set = [(0, start)]
+        came_from = {}
+        g_score = {start: 0}
+        f_score = {start: self._calculate_distance(start, end)}
+        
+        while open_set:
+            current = heapq.heappop(open_set)[1]
+            
+            if self._are_adjacent(current, end):
+                path = [end]
+                while current in came_from:
+                    path.append(current)
+                    current = came_from[current]
+                return path[::-1]
+                
+            for dx, dy in self.directions[:-1]:  # Exclude 'stay'
+                neighbor = (current[0] + dx, current[1] + dy)
+                
+                if (0 <= neighbor[0] < self.n and 0 <= neighbor[1] < self.m and 
+                    self.grid[neighbor[0], neighbor[1]] == 1):
+                    
+                    tentative_g_score = g_score[current] + 1
+                    
+                    if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
+                        came_from[neighbor] = current
+                        g_score[neighbor] = tentative_g_score
+                        f_score[neighbor] = tentative_g_score + self._calculate_distance(neighbor, end)
+                        heapq.heappush(open_set, (f_score[neighbor], neighbor))
+                        
+        return None
