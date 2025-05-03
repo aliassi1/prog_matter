@@ -368,20 +368,174 @@ class GridEnvironment:
       - Connectivity checks, etc.
     """
     def __init__(self, n: int, m: int):
-        self.n = n
-        self.m = m
-        self.agents: Dict[int, BlockAgent] = {}
+        self.n = n  # Grid height
+        self.m = m  # Grid width
+        self.agents: Dict[int, BlockAgent] = {}  # Dictionary to store agents
         
-    def is_free(self, x: int, y: int) -> bool:
-        """
-        Check if a cell is free (not blocked)
-        """
+        # Configuration settings
+        self.topology = "Von Neumann"  # Default topology
+        self.decision_making = "Centralized"  # Default decision making
+        self.movement_type = "Sequential"  # Default movement type
+        
+        # Direction mappings for different topologies
+        self.topology_directions = {
+            "Von Neumann": [
+                (0, 1),   # Right
+                (1, 0),   # Down
+                (0, -1),  # Left
+                (-1, 0)   # Up
+            ],
+            "Moore": [
+                (0, 1),    # Right
+                (1, 0),    # Down
+                (0, -1),   # Left
+                (-1, 0),   # Up
+                (1, 1),    # Down-Right
+                (1, -1),   # Down-Left
+                (-1, -1),  # Up-Left
+                (-1, 1)    # Up-Right
+            ]
+        }
+        
+        # Initialize grid with no obstacles
+        self.grid = [[True for _ in range(m)] for _ in range(n)]
+    
+    def set_topology(self, topology):
+        """Set the topology type"""
+        if topology in self.topology_directions:
+            self.topology = topology
+    
+    def set_decision_making(self, decision_making):
+        """Set the decision making type"""
+        self.decision_making = decision_making
+    
+    def set_movement_type(self, movement_type):
+        """Set the movement type"""
+        self.movement_type = movement_type
+    
+    def get_valid_moves(self, agent):
+        """Get valid moves based on current topology"""
+        valid_moves = []
+        directions = self.topology_directions[self.topology]
+        
+        for dx, dy in directions:
+            new_x = agent.x + dx
+            new_y = agent.y + dy
+            
+            # Check if move is within grid bounds and cell is free
+            if (0 <= new_x < self.m and 0 <= new_y < self.n and 
+                self.grid[new_y][new_x] and 
+                not self.is_occupied(new_x, new_y, exclude_agent=agent)):
+                valid_moves.append((new_x, new_y))
+        
+        return valid_moves
+    
+    def propose_moves_sequential(self):
+        """Propose moves for agents in sequential order"""
+        moves = {}
+        processed_positions = set()
+        
         for agent_id, agent in self.agents.items():
-            if (agent.x, agent.y) == (x, y):
-                return False
-        return True
+            if agent.target is None:
+                continue
+                
+            best_move = None
+            best_distance = float('inf')
+            
+            valid_moves = self.get_valid_moves(agent)
+            for move in valid_moves:
+                if move not in processed_positions:
+                    distance = self.manhattan_distance(move, agent.target)
+                    if distance < best_distance:
+                        best_distance = distance
+                        best_move = move
+            
+            if best_move:
+                moves[agent_id] = best_move
+                processed_positions.add(best_move)
+            
+        return moves
+    
+    def propose_moves_parallel(self):
+        """Propose moves for all agents simultaneously"""
+        moves = {}
+        
+        for agent_id, agent in self.agents.items():
+            if agent.target is None:
+                continue
+                
+            valid_moves = self.get_valid_moves(agent)
+            if valid_moves:
+                # Choose the move that gets closest to target
+                best_move = min(valid_moves, 
+                              key=lambda m: self.manhattan_distance(m, agent.target))
+                moves[agent_id] = best_move
+        
+        return moves
+    
+    def propose_moves_async(self):
+        """Propose moves asynchronously (random order)"""
+        agent_ids = list(self.agents.keys())
+        np.random.shuffle(agent_ids)
+        
+        moves = {}
+        processed_positions = set()
+        
+        for agent_id in agent_ids:
+            agent = self.agents[agent_id]
+            if agent.target is None:
+                continue
+                
+            valid_moves = self.get_valid_moves(agent)
+            valid_moves = [m for m in valid_moves if m not in processed_positions]
+            
+            if valid_moves:
+                best_move = min(valid_moves, 
+                              key=lambda m: self.manhattan_distance(m, agent.target))
+                moves[agent_id] = best_move
+                processed_positions.add(best_move)
+        
+        return moves
+    
+    def apply_moves_centralized(self, moves):
+        """Apply moves with centralized decision making"""
+        # Validate all moves first
+        valid_moves = {}
+        occupied_positions = set()
+        
+        for agent_id, new_pos in moves.items():
+            if new_pos not in occupied_positions:
+                valid_moves[agent_id] = new_pos
+                occupied_positions.add(new_pos)
+        
+        # Apply valid moves
+        for agent_id, new_pos in valid_moves.items():
+            agent = self.agents[agent_id]
+            agent.x, agent.y = new_pos
+    
+    def apply_moves_distributed(self, moves):
+        """Apply moves with distributed decision making"""
+        # Each agent makes its own decision based on local information
+        for agent_id, new_pos in moves.items():
+            agent = self.agents[agent_id]
+            
+            # Check if move is still valid
+            if not self.is_occupied(new_pos[0], new_pos[1], exclude_agent=agent):
+                agent.x, agent.y = new_pos
+    
+    def manhattan_distance(self, pos1, pos2):
+        """Calculate Manhattan distance between two positions"""
+        return abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
+    
+    def is_occupied(self, x, y, exclude_agent=None):
+        """Check if a position is occupied by any agent except the excluded one"""
+        for agent in self.agents.values():
+            if agent != exclude_agent and agent.x == x and agent.y == y:
+                return True
+        return False
     
     def add_agent(self, agent: BlockAgent):
+        """Add an agent to the environment"""
         # Make sure no agent has same ID
         if agent.agent_id in self.agents:
             raise ValueError(f"Agent with ID {agent.agent_id} already exists.")
@@ -408,12 +562,14 @@ class GridEnvironment:
         In a parallel sense, each agent decides its move. 
         Return a dict: agent_id -> (dx, dy).
         """
-        moves = {}
-        for agent_id, agent in self.agents.items():
-            dx, dy = agent.decide_action(self)
-            moves[agent_id] = (dx, dy)
-
-        return moves
+        if self.decision_making == "Centralized":
+            return self.propose_moves_centralized(self.propose_moves_sequential())
+        elif self.decision_making == "Distributed":
+            return self.propose_moves_distributed(self.propose_moves_parallel())
+        elif self.decision_making == "Asynchronous":
+            return self.propose_moves_async()
+        else:
+            raise ValueError("Unknown decision making type")
     
     def calculate_target_centroid(self):
         """Calculate the centroid of all agent targets"""
