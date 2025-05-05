@@ -100,7 +100,7 @@ class TrailInterface:
         # Fonts - using default fonts but with different sizes for a cleaner look
         pygame.font.init()
         self.title_font = pygame.font.Font(None, 72)
-        self.button_font = pygame.font.Font(None, 36)
+        self.button_font = pygame.font.Font(None, 30)  # Changed from 36 to 32
         self.subtitle_font = pygame.font.Font(None, 32)
         self.config_font = pygame.font.Font(None, 28)
         
@@ -387,7 +387,7 @@ class TrailInterface:
             self.draw_background()  # Use new background system
             pulse = (math.sin(self.animation_tick) + 1) / 2
             banner_height = 120
-            pygame.draw.rect(self.screen, (40, 40, 80), (0, 0, self.WIDTH, banner_height))
+            pygame.draw.rect(self.screen, (20, 60, 45), (0, 0, self.WIDTH, banner_height))
             highlight_height = 5 + int(pulse * 3)
             pygame.draw.rect(self.screen, self.SECONDARY, (0, banner_height, self.WIDTH, highlight_height))
             glow_size = 2 + int(pulse * 3)
@@ -438,7 +438,7 @@ class TrailInterface:
             self.draw_background()  # Use new background system
             pulse = (math.sin(self.animation_tick) + 1) / 2
             banner_height = 120
-            pygame.draw.rect(self.screen, (40, 40, 80), (0, 0, self.WIDTH, banner_height))
+            pygame.draw.rect(self.screen, (20, 60, 45), (0, 0, self.WIDTH, banner_height))
             highlight_height = 5 + int(pulse * 3)
             pygame.draw.rect(self.screen, self.SECONDARY, (0, banner_height, self.WIDTH, highlight_height))
             glow_size = 2 + int(pulse * 3)
@@ -508,7 +508,7 @@ class TrailInterface:
             
             # Draw header
             banner_height = 120
-            pygame.draw.rect(self.screen, (40, 40, 80), (0, 0, self.WIDTH, banner_height))
+            pygame.draw.rect(self.screen, (20, 60, 45), (0, 0, self.WIDTH, banner_height))
             highlight_height = 5 + int(pulse * 3)
             pygame.draw.rect(self.screen, self.SECONDARY, (0, banner_height, self.WIDTH, highlight_height))
             
@@ -593,7 +593,7 @@ class TrailInterface:
             
             # Draw header
             banner_height = 120
-            pygame.draw.rect(self.screen, (40, 40, 80), (0, 0, self.WIDTH, banner_height))
+            pygame.draw.rect(self.screen, (20, 60, 45), (0, 0, self.WIDTH, banner_height))
             title_surface = self.title_font.render("Manual Placement", True, self.WHITE)
             title_rect = title_surface.get_rect(center=(self.WIDTH//2, banner_height//2))
             self.screen.blit(title_surface, title_rect)
