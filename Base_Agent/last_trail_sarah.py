@@ -243,7 +243,7 @@ class BlockAgent:
             # If it's connected, propose this move
             return (dx, dy)
         else:
-            # If it breaks connectivity, do not move
+            print(f"Agent {self.agent_id}: move {path} rejected due to connectivity")
             return (0, 0)
 
     # def detect_deadlock(self, env, history_length=30):  # Reduced from 60 to 30

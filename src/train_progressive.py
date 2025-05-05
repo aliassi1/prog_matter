@@ -107,6 +107,15 @@ class ProgressiveTrainer:
         
         # Set checkpoint directory to the parent of the loaded checkpoint
         self.checkpoint_dir = os.path.dirname(checkpoint_path)
+        
+        print(f"Loaded checkpoint from level {checkpoint['level']}")
+        print(f"Success rate: {checkpoint['level_stats']['success_rate']:.2f}")
+        print(f"Episodes played: {checkpoint['level_stats']['episodes_played']}")
+        
+        # If we're continuing from a previous level, ensure we're at the right level
+        if self.level_manager.current_level > 1:
+            print(f"Continuing training from level {self.level_manager.current_level}")
+            print(f"Level focus: {self.level_manager.level_focus[self.level_manager.current_level]['name']}")
 
     def render(self, env_idx=0):
         """Render the current environment state"""
@@ -330,19 +339,24 @@ class ProgressiveTrainer:
             print(f"Success Rate: {self.level_manager.success_count / max(1, self.level_manager.episode_count):.2f}")
             print(f"Episodes in Level: {self.level_manager.episode_count}/{self.level_manager.min_episodes_per_level}")
             
-            # Save checkpoint if best reward
-            if avg_reward > self.best_reward:
-                self.best_reward = avg_reward
+            # Save checkpoint if best reward or every 10 episodes
+            if avg_reward > self.best_reward or episode % 10 == 0:
+                if avg_reward > self.best_reward:
+                    self.best_reward = avg_reward
+                    print("New best reward! Saving checkpoint...")
                 self.save_checkpoint()
-                print("New best reward! Checkpoint saved.")
             
             # Check for level progression
             if (self.level_manager.episode_count >= self.level_manager.min_episodes_per_level and 
                 self.level_manager.success_count / self.level_manager.episode_count >= self.level_manager.success_threshold):
+                # Save checkpoint before advancing level
+                self.save_checkpoint()
                 self.level_manager.advance_level()
                 self.envs = [self.level_manager.create_level_env() for _ in range(self.num_parallel_envs)]
                 print(f"\nLevel Up! Now at level {self.level_manager.current_level}")
                 print(f"New Level Success Rate: 0.00 (Starting fresh)")
+                # Save checkpoint after advancing level
+                self.save_checkpoint()
 
     def evaluate_success_rate(self, num_eval_episodes=10):
         """Evaluate success rate across parallel environments"""
@@ -371,13 +385,24 @@ class ProgressiveTrainer:
 
     def save_checkpoint(self):
         """Save current model checkpoint"""
+        # Ensure checkpoint directory exists
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        
         checkpoint = {
             "level": self.level_manager.current_level,
             "agent_state_dict": self.agent.state_dict(),
             "level_stats": self.level_manager.get_level_stats()
         }
-        torch.save(checkpoint, f"{self.checkpoint_dir}/level_{self.level_manager.current_level}.pt")
-        print(f"Saved checkpoint to {self.checkpoint_dir}/level_{self.level_manager.current_level}.pt")
+        
+        # Save checkpoint with level number
+        checkpoint_path = f"{self.checkpoint_dir}/level_{self.level_manager.current_level}.pt"
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Saved checkpoint to {checkpoint_path}")
+        
+        # Also save a latest checkpoint
+        latest_path = f"{self.checkpoint_dir}/latest.pt"
+        torch.save(checkpoint, latest_path)
+        print(f"Saved latest checkpoint to {latest_path}")
 
 def find_latest_checkpoint():
     """Find the most recent checkpoint directory"""

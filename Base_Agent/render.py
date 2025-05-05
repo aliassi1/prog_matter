@@ -1,9 +1,12 @@
+import os
 import pygame
 import numpy as np
 from tkinter import Tk, filedialog
 from PIL import Image
 from last_trail_sarah import GridEnvironment, BlockAgent
 from scipy.optimize import linear_sum_assignment
+import random
+import math
 
 class PygameRenderer:
     """
@@ -11,30 +14,37 @@ class PygameRenderer:
     
     """
     def __init__(self, env: GridEnvironment=None, cell_size=50, background_image=None):
+        # Set window position to top-left (same as interface)
+        os.environ['SDL_VIDEO_WINDOW_POS'] = '0,0'
         # Initialize Pygame
         pygame.init()
         pygame.display.set_caption("Block Agent Simulation")
         
+        # Match interface window size
+        self.screen_width = 1200
+        self.screen_height = 800
         self.cell_size = cell_size
         self.env = env
         
-        # Will be set later if not provided
+        # Set grid size based on environment or default
         if env:
-
             self.grid_width = env.n
             self.grid_height = env.m
-            self.screen_width = self.grid_width * self.cell_size
-            self.screen_height = self.grid_height * self.cell_size
-            self.screen = pygame.display.set_mode((self.screen_width, self.screen_height))
-
-
         else:
             self.grid_width = 80
             self.grid_height = 80
-            self.screen_width = self.grid_width * self.cell_size
-            self.screen_height = self.grid_height * self.cell_size
-            self.screen = pygame.display.set_mode((self.screen_width, self.screen_height))
+        
+        self.screen = pygame.display.set_mode((self.screen_width, self.screen_height))
 
+        # Particle animation setup (match interface)
+        self.PRIMARY = (90, 175, 110)
+        self.SECONDARY = (240, 130, 170)
+        self.TERTIARY = (160, 210, 150)
+        self.QUATERNARY = (255, 190, 145)
+        self.BACKGROUND_COLOR = (15, 50, 40)
+        self.bg_particles = self.create_particles(100)
+        self.animation_tick = 0
+        self.animation_speed = 0.05
 
     def load_image(self):
         """Load an image using file dialog"""
@@ -303,47 +313,118 @@ class PygameRenderer:
             
         pygame.quit()
 
-    def render(self):
-        # Fill background with white
-        self.screen.fill((255, 255, 255))
-        
-        # Draw grid lines
-        for x in range(self.grid_width):
-            for y in range(self.grid_height):
-                rect = pygame.Rect(
-                    x * self.cell_size,
-                    y * self.cell_size,
-                    self.cell_size,
-                    self.cell_size
-                )
-                # Draw a light gray outline for each cell
-                pygame.draw.rect(self.screen, (200, 200, 200), rect, 1)
+    def create_particles(self, count):
+        particles = []
+        for _ in range(count):
+            x = random.randint(0, self.screen_width)
+            y = random.randint(0, self.screen_height)
+            size = random.uniform(1, 5)
+            speed = random.uniform(0.2, 1)
+            color_type = random.choice(["primary", "secondary", "tertiary", "quaternary"])
+            particles.append({
+                "x": x, 
+                "y": y, 
+                "size": size, 
+                "speed": speed,
+                "color_type": color_type,
+                "angle": random.uniform(0, math.pi * 2)
+            })
+        return particles
 
-        # Draw targets as light red squares
+    def draw_particles(self):
+        for particle in self.bg_particles:
+            # Update position with a gentle floating motion
+            particle["x"] += math.sin(particle["angle"]) * particle["speed"]
+            particle["y"] += math.cos(particle["angle"]) * particle["speed"]
+            particle["angle"] += 0.01
+            # Wrap around screen
+            if particle["x"] < 0:
+                particle["x"] = self.screen_width
+            elif particle["x"] > self.screen_width:
+                particle["x"] = 0
+            if particle["y"] < 0:
+                particle["y"] = self.screen_height
+            elif particle["y"] > self.screen_height:
+                particle["y"] = 0
+            # Determine color based on type
+            if particle["color_type"] == "primary":
+                color = self.PRIMARY
+            elif particle["color_type"] == "secondary":
+                color = self.SECONDARY
+            elif particle["color_type"] == "tertiary":
+                color = self.TERTIARY
+            else:
+                color = self.QUATERNARY
+            # Add transparency
+            alpha = random.randint(30, 100)
+            particle_color = (*color, alpha)
+            # Draw particle with glow effect
+            glow_surface = pygame.Surface((particle["size"] * 3, particle["size"] * 3), pygame.SRCALPHA)
+            pygame.draw.circle(
+                glow_surface, 
+                (*color, 40), 
+                (glow_surface.get_width() // 2, glow_surface.get_height() // 2), 
+                particle["size"] * 1.5
+            )
+            self.screen.blit(
+                glow_surface, 
+                (particle["x"] - glow_surface.get_width() // 2, 
+                 particle["y"] - glow_surface.get_height() // 2)
+            )
+            pygame.draw.circle(
+                self.screen, 
+                particle_color, 
+                (int(particle["x"]), int(particle["y"])), 
+                particle["size"]
+            )
+
+    def render(self):
+        # Fill background with the same dark green as placement mode
+        self.screen.fill(self.BACKGROUND_COLOR)
+        self.animation_tick += self.animation_speed
+        self.draw_particles()
+        
+        # Calculate grid pixel size and offsets to center
+        grid_pixel_width = self.grid_width * self.cell_size
+        grid_pixel_height = self.grid_height * self.cell_size
+        offset_x = (self.screen_width - grid_pixel_width) // 2
+        offset_y = (self.screen_height - grid_pixel_height) // 2
+
+        # Draw grid lines (match placement mode)
+        grid_color = (100, 150, 130)  # Subtle greenish grid lines
+        for x in range(self.grid_width + 1):
+            pygame.draw.line(self.screen, grid_color,
+                             (offset_x + x * self.cell_size, offset_y),
+                             (offset_x + x * self.cell_size, offset_y + grid_pixel_height), 1)
+        for y in range(self.grid_height + 1):
+            pygame.draw.line(self.screen, grid_color,
+                             (offset_x, offset_y + y * self.cell_size),
+                             (offset_x + grid_pixel_width, offset_y + y * self.cell_size), 1)
+
+        # Draw targets as pink squares (match placement mode destinations)
         if self.env:
             for agent in self.env.agents.values():
                 if agent.target:
                     tx, ty = agent.target
                     target_rect = pygame.Rect(
-                        tx * self.cell_size + 4,
-                        ty * self.cell_size + 4,
-                        self.cell_size - 8,
-                        self.cell_size - 8
+                        offset_x + tx * self.cell_size,
+                        offset_y + ty * self.cell_size,
+                        self.cell_size,
+                        self.cell_size
                     )
-                    pygame.draw.rect(self.screen, (255, 200, 200), target_rect)
+                    pygame.draw.rect(self.screen, self.SECONDARY, target_rect)  # Vibrant pink
 
-        # Draw each agent as a smaller square (blue block) within its cell
+        # Draw each agent as a green square (match placement mode agents)
         if self.env:
-            padding = 4  # Padding to keep the square inside the cell
             for agent in self.env.agents.values():
                 ax, ay = agent.x, agent.y
                 block_rect = pygame.Rect(
-                    ax * self.cell_size + padding,
-                    ay * self.cell_size + padding,
-                    self.cell_size - 2 * padding,
-                    self.cell_size - 2 * padding
+                    offset_x + ax * self.cell_size,
+                    offset_y + ay * self.cell_size,
+                    self.cell_size,
+                    self.cell_size
                 )
-                pygame.draw.rect(self.screen, (0, 0, 255), block_rect)
+                pygame.draw.rect(self.screen, self.PRIMARY, block_rect)  # Emerald green
 
         # Flip (update) the display
         pygame.display.flip()

@@ -42,14 +42,16 @@ class LevelManager:
                 "num_agents": 1
             },
             2: {
-                "name": "Random Face",
-                "description": "Agents form a random connected shape",
+                "name": "Line Formation",
+                "description": "Agents start in a straight line and must form another straight line",
                 "obstacle_density": 0.0,
-                "target_pattern": "random_connected",
+                "target_pattern": "line",
                 "connectivity_weight": 1.5,
                 "progress_weight": 1.2,
                 "step_penalty": 0.1,
-                "num_agents": 6
+                "num_agents": 6,  # Fixed to 6 agents for level 2
+                "initial_formation": "line",  # Specify initial formation
+                "target_formation": "line"    # Specify target formation
             },
             3: {
                 "name": "Square Formation",
@@ -146,11 +148,30 @@ class LevelManager:
             return targets
             
         elif pattern == "line":
+            # For level 2, we want exactly 6 agents in a line
+            if hasattr(self, 'current_level') and self.current_level == 2:
+                num_agents = 6
+                # Place a horizontal line centered in the grid
+                y = m // 2
+                available_width = n - 2 * margin
+                spacing = 1
+                # Center the line
+                total_line_width = (num_agents - 1) * spacing
+                start_x = (n - total_line_width) // 2
+                targets = [(start_x + i * spacing, y) for i in range(num_agents)]
+                return targets
+            
+            # For other levels, use the original line placement logic
             y = m // 2
-            spacing = (n - 2 * margin) / (num_agents - 1)
-            for i in range(num_agents):
-                x = margin + int(i * spacing)
-                targets.append((x, y))
+            available_width = n - 2 * margin
+            if num_agents > available_width:
+                spacing = 1  # fallback: agents will be packed
+            else:
+                spacing = max(1, available_width // (num_agents + 1))
+            # Center the line if possible
+            total_line_width = (num_agents - 1) * spacing
+            start_x = (n - total_line_width) // 2
+            targets = [(start_x + i * spacing, y) for i in range(num_agents)]
             return targets
             
         # All other patterns: connected random walk
@@ -191,7 +212,7 @@ class LevelManager:
             params['target_pattern']
         )
         
-        return ProgrammableMatterEnv(
+        env = ProgrammableMatterEnv(
             grid_size=params['grid_size'],
             num_agents=params['num_agents'],
             max_steps=200,  # Increased max steps for more complex levels
@@ -200,8 +221,13 @@ class LevelManager:
             connectivity_weight=params['connectivity_weight'],
             progress_weight=params['progress_weight'],
             step_penalty=params['step_penalty'],
-            completion_reward=params['completion_reward']
+            completion_reward=params['completion_reward'],
+            fast_mode=True  # <--- FAST MODE ENABLED
         )
+        
+        # Set the current level in the environment
+        env.level = self.current_level
+        return env
     
     def update_level_progress(self, success: bool):
         """Update level progress based on episode outcome"""
@@ -344,4 +370,24 @@ if __name__ == "__main__":
     lm = LevelManager()
     for level in range(1, lm.max_levels + 1):
         lm.print_level_details(level)
-        lm.plot_level(level) 
+        lm.plot_level(level)
+
+    # Example: For 6 agents, grid size 30x30
+    num_agents = 6
+    env = ProgrammableMatterEnv(num_agents=num_agents, grid_size=(30, 30))
+
+    # Generate a horizontal line of targets in the middle row
+    line_targets = env._generate_target_positions(num_agents, pattern="line")
+    env.target_positions = line_targets
+
+    # Now reset the environment to use these targets
+    env.reset()
+
+    # Assuming you have a variable `level` to indicate the current level
+    if level == 2:
+        num_agents = env.num_agents
+        env.target_positions = env._generate_target_positions(num_agents, pattern="line")
+        env.reset()
+    else:
+        env.target_positions = None  # Or use another pattern
+        env.reset() 

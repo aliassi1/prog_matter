@@ -39,6 +39,7 @@ class ProgrammableMatterEnv(ParallelEnv):
         completion_reward: float = 100.0,
         obstacle_positions=None,
         target_positions=None,
+        fast_mode: bool = False,
     ):
         """Initialize the programmable matter environment."""
         super().__init__()
@@ -118,6 +119,12 @@ class ProgrammableMatterEnv(ParallelEnv):
         # Add visited positions
         self.visited_positions = {agent_id: set() for agent_id in self.agents}
 
+        self.deadlock_counter = 0
+        self.last_positions = None
+        self.fast_mode = fast_mode
+
+        self.reached_target_once = {agent_id: False for agent_id in self.agents}
+
     def reset(self, seed=None, return_info=False, options=None):
         """Reset the environment to initial state."""
         if seed is not None:
@@ -136,8 +143,15 @@ class ProgrammableMatterEnv(ParallelEnv):
         # Create a connected initial configuration
         self._place_connected_agents()
 
-        # Assign targets to agents
+        # For level 2, always generate a line for targets
+        if hasattr(self, 'level') and self.level == 2:
+            self.target_positions = self._generate_target_positions(self.num_agents, pattern='line')
         self._assign_targets()
+
+        if not self.fast_mode:
+            print("Initial agent positions and targets:")
+            for agent_id in self.agents:
+                print(f"  {agent_id}: position={self.agent_positions[agent_id]}, target={self.agent_targets[agent_id]}")
 
         # Calculate initial distances to targets
         self.previous_distances = {
@@ -161,15 +175,14 @@ class ProgrammableMatterEnv(ParallelEnv):
     def step(self, actions):
         """Execute one step for all agents based on their actions."""
         self.steps_taken += 1
-
+        # Store previous positions for deadlock detection and overlap revert
+        prev_positions = self.agent_positions.copy()
         # Store proposed new positions
         proposed_positions = {}
         for agent_id, action in actions.items():
             dx, dy = self.directions[action]
             x, y = self.agent_positions[agent_id]
             new_x, new_y = x + dx, y + dy
-
-            # Check if position is valid (in bounds and not an obstacle)
             if (
                 0 <= new_x < self.n
                 and 0 <= new_y < self.m
@@ -178,10 +191,44 @@ class ProgrammableMatterEnv(ParallelEnv):
                 proposed_positions[agent_id] = (new_x, new_y)
             else:
                 proposed_positions[agent_id] = (x, y)  # Stay in place if invalid
-
         # Resolve collisions and ensure connectivity
         self._resolve_moves(proposed_positions)
-
+        # Deadlock detection: if no agent moved, increment counter
+        if self.last_positions is not None and all(self.agent_positions[aid] == self.last_positions[aid] for aid in self.agents):
+            self.deadlock_counter += 1
+        else:
+            self.deadlock_counter = 0
+        self.last_positions = self.agent_positions.copy()
+        # If deadlock for 10 steps, randomly move one agent (to a truly free cell)
+        if self.deadlock_counter >= 10:
+            agent_id = random.choice(list(self.agents))
+            possible_moves = [i for i, (dx, dy) in enumerate(self.directions)
+                             if 0 <= self.agent_positions[agent_id][0] + dx < self.n
+                             and 0 <= self.agent_positions[agent_id][1] + dy < self.m
+                             and self.grid[self.agent_positions[agent_id][0] + dx, self.agent_positions[agent_id][1] + dy] == 1
+                             and (self.agent_positions[agent_id][0] + dx, self.agent_positions[agent_id][1] + dy) not in self.agent_positions.values()]
+            if possible_moves:
+                move = random.choice(possible_moves)
+                dx, dy = self.directions[move]
+                x, y = self.agent_positions[agent_id]
+                new_pos = (x + dx, y + dy)
+                self.agent_positions[agent_id] = new_pos
+                if not self.fast_mode:
+                    print(f"[DEADLOCK BREAK] Randomly moved {agent_id} to {new_pos} to break deadlock.")
+            self.deadlock_counter = 0
+        # FINAL ATOMIC ANTI-OVERLAP CHECK
+        pos_counts = {}
+        for aid, pos in self.agent_positions.items():
+            pos_counts[pos] = pos_counts.get(pos, 0) + 1
+        overlap_agents = [aid for aid, pos in self.agent_positions.items() if pos_counts[pos] > 1]
+        if overlap_agents:
+            if not self.fast_mode:
+                print(f"[FINAL ANTI-OVERLAP] Overlap detected after all moves! Reverting moves for agents: {overlap_agents}")
+            for aid in overlap_agents:
+                self.agent_positions[aid] = prev_positions[aid]
+        if len(set(self.agent_positions.values())) != len(self.agent_positions):
+            print("Agent positions (overlap detected after step):", self.agent_positions)
+        assert len(set(self.agent_positions.values())) == len(self.agent_positions), "Agent overlap detected after all moves!"
         # Calculate rewards
         rewards = {}
         for agent_id in self.agents:
@@ -190,13 +237,20 @@ class ProgrammableMatterEnv(ParallelEnv):
             if pos in self.visited_positions[agent_id]:
                 rewards[agent_id] -= 0.5
             self.visited_positions[agent_id].add(pos)
-
+        # Add large negative penalty if max_steps reached and agent did not reach goal
+        if self.steps_taken >= self.max_steps:
+            for agent_id in self.agents:
+                if self.agent_positions[agent_id] != self.agent_targets[agent_id]:
+                    # Proportional penalty based on distance to target
+                    dist = self._calculate_distance(self.agent_positions[agent_id], self.agent_targets[agent_id])
+                    # Penalty is -50 if far, less if close
+                    penalty = -10 - 40 * (dist / (self.n + self.m))
+                    rewards[agent_id] += penalty
         # Update previous distances
         for agent_id in self.agents:
             self.previous_distances[agent_id] = self._calculate_distance(
                 self.agent_positions[agent_id], self.agent_targets[agent_id]
             )
-
         # Check if done
         dones = {}
         target_reached = {}
@@ -206,195 +260,206 @@ class ProgrammableMatterEnv(ParallelEnv):
             target_reached[agent_id] = at_target
             if not at_target:
                 all_at_target = False
-            dones[agent_id] = at_target or self.steps_taken >= self.max_steps
-
+            # In level 1, agents are done when they reach their target
+            # In other levels, agents stay active until all reach targets
+            if getattr(self, 'level', 1) == 1:
+                dones[agent_id] = at_target or self.steps_taken >= self.max_steps
+            else:
+                # In level 2+, agents are never done individually
+                dones[agent_id] = False
         # If max steps reached, all agents are done
         if self.steps_taken >= self.max_steps:
             dones = {agent_id: True for agent_id in self.agents}
-
-        # Global termination if all agents reached targets
-        dones["__all__"] = all_at_target or self.steps_taken >= self.max_steps
-
+        # Global termination if all agents reached targets (only in level 1)
+        if getattr(self, 'level', 1) == 1:
+            dones["__all__"] = all_at_target or self.steps_taken >= self.max_steps
+        else:
+            dones["__all__"] = self.steps_taken >= self.max_steps
         # Compute observations
         observations = {}
         for agent_id in self.agents:
             observations[agent_id] = self._get_observation(agent_id)
-
         # Additional info
         infos = {agent_id: {"target_reached": target_reached[agent_id]} for agent_id in self.agents}
-
         # Optionally render
-        if self.render_mode == "human":
+        if self.render_mode == "human" and not self.fast_mode:
             self.render()
-
         return observations, rewards, dones, infos
 
     def _place_connected_agents(self):
         """Place agents on the grid in a connected configuration."""
+        # For level 2, place agents in a straight line
+        if hasattr(self, 'level') and self.level == 2:
+            self._place_agents_in_line()
+            # Assert no overlap after placement
+            assert len(set(self.agent_positions.values())) == len(self.agent_positions), "Agent overlap detected after line placement!"
+            return
         # Start with one agent
         while True:
             start_x = np.random.randint(1, self.n - 1)
             start_y = np.random.randint(1, self.m - 1)
             if self.grid[start_x, start_y] == 1:  # Only place on free cells
                 break
-
         self.agent_positions[self.possible_agents[0]] = (start_x, start_y)
-
-        # Place remaining agents to ensure connectivity
         placed_agents = [self.possible_agents[0]]
-
         for i in range(1, self.num_agents):
             agent_id = self.possible_agents[i]
-
-            # Try to find a valid adjacent position to an existing agent
             valid_positions = []
             for placed_agent in placed_agents:
                 x, y = self.agent_positions[placed_agent]
-
                 for dx, dy in self.directions[:-1]:  # Exclude 'stay'
                     new_x, new_y = x + dx, y + dy
-
-                    # Check if position is valid, not occupied, and not an obstacle
                     if (
                         0 <= new_x < self.n
                         and 0 <= new_y < self.m
                         and self.grid[new_x, new_y] == 1
-                        and all(
-                            (new_x, new_y) != self.agent_positions.get(a)
-                            for a in placed_agents
-                        )
+                        and all((new_x, new_y) != self.agent_positions.get(a) for a in placed_agents)
                     ):
                         valid_positions.append((new_x, new_y))
-
             if not valid_positions:
-                # Fallback: place close to existing agents but not necessarily adjacent
                 placed_positions = list(self.agent_positions.values())
+                search_radius = 2
                 while not valid_positions:
                     x, y = placed_positions[np.random.randint(len(placed_positions))]
-                    search_radius = 2
-
                     for dx in range(-search_radius, search_radius + 1):
                         for dy in range(-search_radius, search_radius + 1):
                             new_x, new_y = x + dx, y + dy
-
                             if (
                                 0 <= new_x < self.n
                                 and 0 <= new_y < self.m
                                 and self.grid[new_x, new_y] == 1
-                                and all(
-                                    (new_x, new_y) != self.agent_positions.get(a)
-                                    for a in placed_agents
-                                )
+                                and all((new_x, new_y) != self.agent_positions.get(a) for a in placed_agents)
                             ):
                                 valid_positions.append((new_x, new_y))
-
                     search_radius += 1
-                    if search_radius > 5:  # Avoid infinite loop
-                        # If we can't find valid positions, restart the whole process
+                    if search_radius > 5:
                         self.agent_positions = {}
                         return self._place_connected_agents()
-
-            # Choose a random valid position
             position = valid_positions[np.random.randint(len(valid_positions))]
             self.agent_positions[agent_id] = position
             placed_agents.append(agent_id)
+        # Assert no overlap after placement
+        assert len(set(self.agent_positions.values())) == len(self.agent_positions), "Agent overlap detected after connected placement!"
+
+    def _place_agents_in_line(self):
+        self.agent_positions = {}  # Clear previous positions!
+        margin = 2
+        y_agents = self.m // 2
+        if hasattr(self, 'level') and self.level == 2:
+            num_agents = 6
+            spacing = 1
+            start_x = (self.n - num_agents) // 2
+            self.agents = self.possible_agents[:num_agents]  # <--- ADD THIS LINE
+            for i, agent_id in enumerate(self.agents):
+                x = start_x + i * spacing
+                if not (0 <= x < self.n and 0 <= y_agents < self.m):
+                    raise ValueError(f"Agent {agent_id} position ({x},{y_agents}) out of bounds!")
+                if self.grid[x, y_agents] != 1:
+                    raise ValueError(f"Agent {agent_id} position ({x},{y_agents}) is an obstacle!")
+                if (x, y_agents) in self.agent_positions.values():
+                    raise ValueError(f"Agent {agent_id} position ({x},{y_agents}) would overlap!")
+                self.agent_positions[agent_id] = (x, y_agents)
+            if len(set(self.agent_positions.values())) != len(self.agent_positions):
+                print("Agent positions (overlap detected):", self.agent_positions)
+            assert len(set(self.agent_positions.values())) == len(self.agent_positions), "Agent overlap detected after line placement!"
+            return
+        # For other levels, use the original placement logic
+        spacing = 1
+        used_positions = set()
+        for i, agent_id in enumerate(self.possible_agents):
+            x = margin + int(i * spacing)
+            while (x, y_agents) in used_positions or self.grid[x, y_agents] != 1:
+                x += 1
+                if x >= self.n - margin:
+                    x = margin
+                    y_agents += 1
+                    if y_agents >= self.m - margin:
+                        y_agents = self.m // 2
+            if (x, y_agents) in self.agent_positions.values():
+                raise ValueError(f"Agent {agent_id} position ({x},{y_agents}) would overlap!")
+            self.agent_positions[agent_id] = (x, y_agents)
+            used_positions.add((x, y_agents))
+        if len(set(self.agent_positions.values())) != len(self.agent_positions):
+            print("Agent positions (overlap detected):", self.agent_positions)
+        assert len(set(self.agent_positions.values())) == len(self.agent_positions), "Agent overlap detected after line placement!"
 
     def _assign_targets(self, clustering_factor=0.5):
-        """
-        Assign targets to agents with optional clustering.
-
-        Args:
-            clustering_factor: 0-1 value where 0 means random targets and
-                             1 means highly clustered targets
-        """
-        # If target positions are provided, use them
-        if self.target_positions is not None:
-            # Ensure we have enough target positions
-            if len(self.target_positions) < self.num_agents:
-                # If not enough targets, generate additional ones
-                additional_targets = self._generate_additional_targets(
-                    self.num_agents - len(self.target_positions),
-                    clustering_factor
-                )
-                self.target_positions.extend(additional_targets)
-            
-            # Ensure no agent starts on its target
-            for agent_id, agent_pos in self.agent_positions.items():
-                while agent_pos in self.target_positions:
-                    # Regenerate the conflicting target
-                    idx = self.target_positions.index(agent_pos)
-                    new_target = self._generate_additional_targets(1, clustering_factor)[0]
-                    self.target_positions[idx] = new_target
-            
-            # Assign targets using Hungarian algorithm for optimal assignment
-            cost_matrix = np.zeros((self.num_agents, len(self.target_positions)))
-            for i, agent_id in enumerate(self.agents):
-                agent_pos = self.agent_positions[agent_id]
-                for j, target_pos in enumerate(self.target_positions):
-                    cost_matrix[i, j] = self._calculate_distance(agent_pos, target_pos)
-            
-            row_ind, col_ind = linear_sum_assignment(cost_matrix)
-            self.agent_targets = {
-                agent_id: self.target_positions[col_ind[i]]
-                for i, agent_id in enumerate(self.agents)
-            }
-            return
-
-        # Create target positions (with clustering)
-        target_positions = []
-
-        if clustering_factor > 0:
-            # Start with a central point
-            center_x = np.random.randint(self.n // 4, 3 * self.n // 4)
-            center_y = np.random.randint(self.m // 4, 3 * self.m // 4)
-
-            # Maximum distance from center (scaled by clustering factor)
-            max_radius = min(self.n, self.m) * (1 - clustering_factor) * 0.5
-
-            while len(target_positions) < self.num_agents:
-                # Generate random angle and distance
-                angle = 2 * math.pi * random.random()
-                distance = max_radius * random.random()
-
-                # Convert to coordinates
-                x = int(center_x + distance * math.cos(angle))
-                y = int(center_y + distance * math.sin(angle))
-
-                # Ensure coordinates are within bounds and not obstacles or agent positions
-                if (
-                    0 <= x < self.n
-                    and 0 <= y < self.m
-                    and self.grid[x, y] == 1
-                    and (x, y) not in target_positions
-                    and (x, y) not in self.agent_positions.values()
-                ):
-                    target_positions.append((x, y))
-        else:
-            # Completely random targets
-            while len(target_positions) < self.num_agents:
-                x = np.random.randint(0, self.n)
-                y = np.random.randint(0, self.m)
-
-                if (
-                    self.grid[x, y] == 1
-                    and (x, y) not in target_positions
-                    and (x, y) not in self.agent_positions.values()
-                ):
-                    target_positions.append((x, y))
-
-        # Assign targets using Hungarian algorithm for optimal assignment
-        cost_matrix = np.zeros((self.num_agents, self.num_agents))
-        for i, agent_id in enumerate(self.agents):
-            agent_pos = self.agent_positions[agent_id]
-            for j, target_pos in enumerate(target_positions):
-                cost_matrix[i, j] = self._calculate_distance(agent_pos, target_pos)
-
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
         self.agent_targets = {
-            agent_id: target_positions[col_ind[i]]
+            agent_id: self.target_positions[i]
             for i, agent_id in enumerate(self.agents)
         }
-        self.target_positions = target_positions
+        if self.target_positions is not None:
+            # For level 2, ensure targets are a line and do not overlap with agents
+            if hasattr(self, 'level') and self.level == 2:
+                overlap = set(self.agent_positions.values()) & set(self.target_positions)
+                if overlap:
+                    raise ValueError(f"Agent(s) initialized on target(s): {overlap}. Please check placement logic.")
+                assert len(set(self.target_positions)) == self.num_agents, "Target overlap detected!"
+                # Assign targets in order (no Hungarian for a line)
+                self.agent_targets = {
+                    agent_id: self.target_positions[i]
+                    for i, agent_id in enumerate(self.agents)
+                }
+                return
+            # ... rest of your code for other levels ...
+        else:
+            # Create target positions (with clustering)
+            target_positions = []
+
+            if clustering_factor > 0:
+                # Start with a central point
+                center_x = np.random.randint(self.n // 4, 3 * self.n // 4)
+                center_y = np.random.randint(self.m // 4, 3 * self.m // 4)
+
+                # Maximum distance from center (scaled by clustering factor)
+                max_radius = min(self.n, self.m) * (1 - clustering_factor) * 0.5
+
+                while len(target_positions) < self.num_agents:
+                    # Generate random angle and distance
+                    angle = 2 * math.pi * random.random()
+                    distance = max_radius * random.random()
+
+                    # Convert to coordinates
+                    x = int(center_x + distance * math.cos(angle))
+                    y = int(center_y + distance * math.sin(angle))
+
+                    # Ensure coordinates are within bounds and not obstacles or agent positions
+                    if (
+                        0 <= x < self.n
+                        and 0 <= y < self.m
+                        and self.grid[x, y] == 1
+                        and (x, y) not in target_positions
+                        and (x, y) not in self.agent_positions.values()
+                    ):
+                        target_positions.append((x, y))
+            else:
+                # Completely random targets
+                while len(target_positions) < self.num_agents:
+                    x = np.random.randint(0, self.n)
+                    y = np.random.randint(0, self.m)
+
+                    if (
+                        self.grid[x, y] == 1
+                        and (x, y) not in target_positions
+                        and (x, y) not in self.agent_positions.values()
+                    ):
+                        target_positions.append((x, y))
+
+            # Assign targets using Hungarian algorithm for optimal assignment
+            cost_matrix = np.zeros((self.num_agents, self.num_agents))
+            for i, agent_id in enumerate(self.agents):
+                agent_pos = self.agent_positions[agent_id]
+                for j, target_pos in enumerate(target_positions):
+                    cost_matrix[i, j] = self._calculate_distance(agent_pos, target_pos)
+
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            self.agent_targets = {
+                agent_id: target_positions[col_ind[i]]
+                for i, agent_id in enumerate(self.agents)
+            }
+            self.target_positions = target_positions
+            # Assert all targets are unique
+            assert len(set(self.target_positions)) == len(self.target_positions), "Target overlap detected!"
 
     def _generate_additional_targets(self, num_additional, clustering_factor):
         """Generate additional target positions when needed."""
@@ -493,51 +558,68 @@ class ProgrammableMatterEnv(ParallelEnv):
         return math.sqrt((pos1[0] - pos2[0]) ** 2 + (pos1[1] - pos2[1]) ** 2)
 
     def _calculate_reward(self, agent_id):
-        """Calculate reward for an agent."""
         reward = 0.0
-
-        # Get current position and target
         current_pos = self.agent_positions[agent_id]
         target_pos = self.agent_targets[agent_id]
-
-        # Calculate current distance to target
         current_distance = self._calculate_distance(current_pos, target_pos)
-
-        # Progress reward (positive only if agent got closer to target)
         previous_distance = self.previous_distances[agent_id]
         progress = previous_distance - current_distance
-        
-        # Stronger rewards/penalties for movement
-        if progress > 0:
-            # Scale the reward based on how much closer the agent got
-            reward += progress * self.progress_weight * 5.0  # Increased from 2.0
-        elif progress < 0:
-            # Stronger penalty for moving away from target
-            reward += progress * self.progress_weight * 5.0  # Increased from 3.0
+
+        # Step penalty (reduced)
+        reward -= self.step_penalty * 0.5
+
+        # Progress reward (increased)
+        if current_pos != target_pos:
+            if progress > 0:
+                reward += progress * self.progress_weight * 3.0
+            elif progress < 0:
+                reward += progress * self.progress_weight * 1.0
+            else:
+                reward -= self.step_penalty * 0.2
+
+            # Distance-based reward (increased)
+            max_possible_distance = math.sqrt(self.n**2 + self.m**2)
+            distance_reward = (max_possible_distance - current_distance) / max_possible_distance
+            reward += distance_reward * self.progress_weight * 1.0
+
+            # Exploration bonus
+            if current_pos not in self.visited_positions[agent_id]:
+                reward += 0.2
+
+            # Small positive living reward
+            reward += 0.05
         else:
-            # Stronger penalty for not making progress
-            reward -= self.step_penalty * 2.0
+            if not self.reached_target_once[agent_id]:
+                reward += 100.0  # Large bonus for reaching the goal (first time only)
+                self.reached_target_once[agent_id] = True
 
-        # Additional reward for being closer to target (inverse distance reward)
-        max_possible_distance = math.sqrt(self.n**2 + self.m**2)
-        distance_reward = (max_possible_distance - current_distance) / max_possible_distance
-        reward += distance_reward * self.progress_weight * 0.2  # Reduced from 0.5 to prevent staying still
-
-        # Completion reward if agent reached its target
-        if current_pos == target_pos:
-            reward += self.completion_reward
-
-        # Connectivity penalty (check if agents are still connected)
+        # Connectivity penalty (reduced)
         all_positions = list(self.agent_positions.values())
         if not self._is_connected(all_positions):
-            reward -= self.connectivity_weight
+            reward -= self.connectivity_weight * 0.5
 
-        # Step penalty to encourage efficiency
-        reward -= self.step_penalty
+        # For level 2: line straightness and spacing (keep, but scale down penalty)
+        if hasattr(self, 'level') and self.level == 2:
+            if self._is_connected(all_positions):
+                if len(all_positions) >= 2:
+                    sorted_positions = sorted(all_positions, key=lambda p: p[0])
+                    avg_y = sum(p[1] for p in sorted_positions) / len(sorted_positions)
+                    y_deviation = sum(abs(p[1] - avg_y) for p in sorted_positions)
+                    max_deviation = len(sorted_positions) * (self.m // 2)
+                    line_straightness = 1.0 - (y_deviation / max_deviation)
+                    reward += line_straightness * self.connectivity_weight * 1.0
 
-        # Update previous distance for next step
+                    min_spacing = 1
+                    spacing_penalty = 0
+                    for i in range(len(sorted_positions) - 1):
+                        spacing = sorted_positions[i + 1][0] - sorted_positions[i][0]
+                        if spacing < min_spacing:
+                            spacing_penalty += (min_spacing - spacing) * 0.2
+                    reward -= spacing_penalty
+            else:
+                reward -= self.connectivity_weight * 1.0  # Reduced penalty
+
         self.previous_distances[agent_id] = current_distance
-
         return reward
 
     def _is_connected(self, positions):
@@ -568,51 +650,78 @@ class ProgrammableMatterEnv(ParallelEnv):
         return len(visited) == len(positions)
 
     def _resolve_moves(self, proposed_positions):
-        """Resolve conflicting moves and ensure connectivity constraints."""
-        # Sort agents by priority (could be distance to target or other metrics)
+        """Resolve conflicting moves and ensure connectivity constraints, including only pairwise swaps and strict anti-overlap."""
         agent_priorities = {}
         for agent_id in self.agents:
             distance = self._calculate_distance(
                 self.agent_positions[agent_id], self.agent_targets[agent_id]
             )
             agent_priorities[agent_id] = distance
-
-        # Sort agents by priority (higher priority first)
         sorted_agents = sorted(self.agents, key=lambda a: agent_priorities[a])
-
-        # Process agents in order of priority
         final_positions = self.agent_positions.copy()
-
+        moved_agents = set()
+        swap_pairs = set()
+        # Track which agents are involved in swaps
+        swap_involved = set()
         for agent_id in sorted_agents:
             if agent_id not in proposed_positions:
                 continue
-
             new_pos = proposed_positions[agent_id]
             old_pos = self.agent_positions[agent_id]
-
-            # Skip if position is unchanged
             if new_pos == old_pos:
                 continue
-
-            # Check for collisions with other agents' final positions
+            # Check if the new position is already occupied by any agent
             if new_pos in final_positions.values():
+                # Check for possible pairwise swap
+                swap_agent = None
+                for other_id, other_old_pos in self.agent_positions.items():
+                    if other_id != agent_id and other_old_pos == new_pos:
+                        if proposed_positions.get(other_id, other_old_pos) == old_pos:
+                            pair = tuple(sorted([agent_id, other_id]))
+                            if pair not in swap_pairs and agent_id not in swap_involved and other_id not in swap_involved:
+                                swap_agent = other_id
+                                swap_pairs.add(pair)
+                                swap_involved.add(agent_id)
+                                swap_involved.add(other_id)
+                                break
+                if swap_agent is not None:
+                    # Perform the swap
+                    final_positions[agent_id] = new_pos
+                    final_positions[swap_agent] = old_pos
+                    moved_agents.add(agent_id)
+                    moved_agents.add(swap_agent)
                 continue
-
-            # Tentatively accept the move
-            tentative_positions = final_positions.copy()
-            tentative_positions[agent_id] = new_pos
-
-            # Check if this breaks connectivity
-            if self._is_connected(list(tentative_positions.values())):
-                final_positions[agent_id] = new_pos
-            # else: revert to old position (already in final_positions)
-
-        # Update agent positions
+            # Check if the move would break connectivity
+            connected = False
+            for other_id, other_pos in final_positions.items():
+                if other_id != agent_id and self._are_adjacent(new_pos, other_pos):
+                    connected = True
+                    break
+            if not connected:
+                tentative_positions = final_positions.copy()
+                tentative_positions[agent_id] = new_pos
+                if not self._is_connected(list(tentative_positions.values())):
+                    continue
+            # Accept the move
+            final_positions[agent_id] = new_pos
+            moved_agents.add(agent_id)
+        # Strict anti-overlap: check for overlaps after all moves
+        pos_counts = {}
+        for aid, pos in final_positions.items():
+            pos_counts[pos] = pos_counts.get(pos, 0) + 1
+        overlap_agents = [aid for aid, pos in final_positions.items() if pos_counts[pos] > 1]
+        if overlap_agents:
+            if not self.fast_mode:
+                print(f"[WARNING] Overlap detected after move resolution! Reverting moves for agents: {overlap_agents}")
+            # Revert moves for involved agents
+            for aid in overlap_agents:
+                final_positions[aid] = self.agent_positions[aid]
         self.agent_positions = final_positions
+        assert len(set(self.agent_positions.values())) == len(self.agent_positions), "Agent overlap detected after move resolution!"
 
     def render(self):
         """Render the environment."""
-        if self.render_mode is None:
+        if self.render_mode is None or getattr(self, 'fast_mode', False):
             return
 
         if self.renderer is None:
@@ -723,25 +832,29 @@ class ProgrammableMatterEnv(ParallelEnv):
     def _generate_target_positions(self, num_targets, pattern, clustering_factor=0.5):
         """Generate connected target positions based on pattern."""
         target_positions = []
-        
-        # Start with a central point
         center_x = self.n // 2
         center_y = self.m // 2
-        
         if pattern == "single":
-            # Single target in the center
             target_positions.append((center_x, center_y))
-            
         elif pattern == "line":
-            # Horizontal line in the middle
-            length = min(num_targets, self.n - 4)  # Leave margin
-            start_x = center_x - length // 2
-            for i in range(num_targets):
-                x = start_x + i
-                y = center_y
-                if 0 <= x < self.n and self.grid[x, y] == 1:
-                    target_positions.append((x, y))
-                    
+            if hasattr(self, 'level') and self.level == 2:
+                num_agents = 6
+                spacing = 1
+                y_targets = self.m // 2 - 2  # Place targets 2 rows above agents, for example
+                start_x = (self.n - num_agents) // 2
+                targets = []
+                for i in range(num_agents):
+                    x = start_x + i
+                    if not (0 <= x < self.n and 0 <= y_targets < self.m):
+                        continue
+                    if self.grid[x, y_targets] != 1:
+                        continue
+                    targets.append((x, y_targets))
+                if len(set(targets)) != num_agents:
+                    print("Target positions (overlap or missing):", targets)
+                assert len(set(targets)) == num_agents, "Target overlap or missing targets!"
+                return targets
+            # ... rest of your code for other levels ...
         elif pattern == "square":
             # Square formation
             side_length = int(np.sqrt(num_targets))
@@ -884,3 +997,31 @@ class ProgrammableMatterEnv(ParallelEnv):
                         heapq.heappush(open_set, (f_score[neighbor], neighbor))
                         
         return None
+
+    def select_action(self, obs, evaluate=False):
+        epsilon = 0.1  # 10% random moves
+        if not evaluate and random.random() < epsilon:
+            # Take a random action
+            return random.randint(0, len(self.directions) - 1)
+        else:
+            # Usual policy action
+            return self.policy_action(obs)
+
+    def policy_action(self, obs):
+        # Implementation of the policy action
+        pass
+
+    def _random_move(self):
+        if self.steps_taken % 50 == 0:  # Every 50 steps
+            for agent_id in self.agents:
+                possible_moves = [i for i, (dx, dy) in enumerate(self.directions)
+                                 if 0 <= self.agent_positions[agent_id][0] + dx < self.n
+                                 and 0 <= self.agent_positions[agent_id][1] + dy < self.m
+                                 and self.grid[self.agent_positions[agent_id][0] + dx, self.agent_positions[agent_id][1] + dy] == 1
+                                 and (self.agent_positions[agent_id][0] + dx, self.agent_positions[agent_id][1] + dy) not in self.agent_positions.values()]
+                if possible_moves:
+                    move = random.choice(possible_moves)
+                    dx, dy = self.directions[move]
+                    x, y = self.agent_positions[agent_id]
+                    self.agent_positions[agent_id] = (x + dx, y + dy)
+
